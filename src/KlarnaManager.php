@@ -59,9 +59,13 @@ class KlarnaManager {
         }
 
         if (empty($adjustments[$key])) {
+          $label_string = $adjustment->getLabel();
+          if (method_exists($label_string, 'getUntranslatedString')) {
+            $label_string = $label_string->getUntranslatedString();
+          }
           $adjustments[$key] = [
-            'reference' => $adjustment->getLabel()->getUntranslatedString(),
-            'name' => $adjustment->getLabel()->getUntranslatedString(),
+            'reference' => $label_string,
+            'name' => $label_string,
             'quantity' => 1,
             'unit_price' => (int) $adjustment->getAmount()->multiply('100')->getNumber(),
             'tax_rate' => 0,
