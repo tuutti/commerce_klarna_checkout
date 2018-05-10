@@ -2,6 +2,8 @@
 
 namespace Drupal\commerce_klarna_checkout;
 
+use Drupal\commerce_klarna_checkout\Event\Events;
+use Drupal\commerce_klarna_checkout\Event\TransactionAlterEvent;
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_price\Calculator;
 use Drupal\Component\Utility\SortArray;
@@ -9,21 +11,51 @@ use Drupal\Component\Utility\Unicode;
 use Drupal\Core\Url;
 use Klarna_Checkout_Connector;
 use Klarna_Checkout_Order;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 
 /**
- * Class KlarnaManager.
- *
- * @package Drupal\commerce_klarna_checkout
+ * Service used for making API calls using Klarna Checkout library.
  */
 class KlarnaManager {
 
   /**
-   * {@inheritdoc}
+   * The event dispatcher.
+   *
+   * @var \Symfony\Component\EventDispatcher\EventDispatcherInterface
    */
-  public function buildTransaction(OrderInterface $order) {
-    $plugin_configuration = $this->getPluginConfiguration($order);
+  protected $eventDispatcher;
 
-    $create['cart']['items'] = [];
+  /**
+   * The api connector.
+   *
+   * @var \Klarna_Checkout_ConnectorInterface
+   */
+  protected $connector;
+
+  /**
+   * Constructs a new instance.
+   *
+   * @param \Symfony\Component\EventDispatcher\EventDispatcherInterface $eventDispatcher
+   *   The event dispatcher.
+   * @param \Klarna_Checkout_ConnectorInterface $connector
+   *   The connector.
+   */
+  public function __construct(EventDispatcherInterface $eventDispatcher, \Klarna_Checkout_ConnectorInterface $connector = NULL) {
+    $this->eventDispatcher = $eventDispatcher;
+    $this->connector = $connector;
+  }
+
+  /**
+   * Builds the order data.
+   *
+   * @param \Drupal\commerce_order\Entity\OrderInterface $order
+   *   The order.
+   *
+   * @return array
+   *   Builds the create order request.
+   */
+  public function buildOrderData(OrderInterface $order) {
+    $data['cart']['items'] = [];
 
     // Add order item data.
     foreach ($order->getItems() as $item) {
@@ -34,7 +66,7 @@ class KlarnaManager {
         }
       }
       $item_amount = $item->getUnitPrice();
-      $create['cart']['items'][] = [
+      $data['cart']['items'][] = [
         'reference' => $item->getTitle(),
         'name' => $item->getTitle(),
         'quantity' => (int) $item->getQuantity(),
@@ -84,34 +116,50 @@ class KlarnaManager {
         }
       }
     }
+    $plugin = $this->getPlugin($order);
     // Sort the adjustments by weight.
     uasort($adjustments, [SortArray::class, 'sortByWeightElement']);
     // Merge adjustments to cart item objects (Klarna).
-    $create['cart']['items'] = array_values(array_merge($create['cart']['items'], $adjustments));
+    $data['cart']['items'] = array_values(array_merge($data['cart']['items'], $adjustments));
 
-    $create['purchase_country'] = $this->getCountryFromLocale($plugin_configuration['language']);
-    $create['purchase_currency'] = $order->getTotalPrice()->getCurrencyCode();
-    $create['locale'] = $plugin_configuration['language'];
-    $create['merchant_reference'] = ['orderid1' => $order->id()];
-    $create['merchant'] = [
-      'id' => $plugin_configuration['merchant_id'],
-      'terms_uri' => Url::fromUserInput($plugin_configuration['terms_path'], ['absolute' => TRUE])->toString(),
+    $data['purchase_country'] = $this->getCountryFromLocale($plugin->getLanguage());
+    $data['purchase_currency'] = $order->getTotalPrice()->getCurrencyCode();
+    $data['locale'] = $plugin->getLanguage();
+    $data['merchant_reference'] = ['orderid1' => $order->id()];
+    $data['merchant'] = [
+      'id' => $plugin->getMerchantId(),
+      'terms_uri' => $plugin->getTermsUrl(),
       'checkout_uri' => $this->getReturnUrl($order, 'commerce_payment.checkout.cancel'),
-      'confirmation_uri' => $this->getReturnUrl($order, 'commerce_payment.checkout.return') . '&klarna_order_id={checkout.order.id}',
-      'push_uri' => $this->getReturnUrl($order, 'commerce_payment.notify', 'complete') . '&klarna_order_id={checkout.order.id}',
+      'confirmation_uri' => $this->getReturnUrl($order, 'commerce_payment.checkout.return'),
+      'push_uri' => $this->getReturnUrl($order, 'commerce_payment.notify', 'complete'),
       'back_to_store_uri' => $this->getReturnUrl($order, 'commerce_payment.checkout.cancel'),
     ];
 
-    try {
-      $connector = $this->getConnector($plugin_configuration);
-      $klarna_order = new Klarna_Checkout_Order($connector);
+    return $data;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function buildTransaction(OrderInterface $order) {
+    $build = $this->buildOrderData($order);
+
+    /** @var \Drupal\commerce_klarna_checkout\Event\TransactionAlterEvent $event */
+    $event = $this->eventDispatcher
+      ->dispatch(Events::TRANSACTION_ALTER, new TransactionAlterEvent($order, 'create', $build));
+
+    // Allow other modules to alter values.
+    $create = $event->getValues();
+
+    // Attempt to update existing order.
+    if ($klarna_order = $this->getOrder($order)) {
+      $klarna_order->update($create);
+    }
+    else {
+      $klarna_order = new Klarna_Checkout_Order($this->getConnector($order));
       $klarna_order->create($create);
-      $klarna_order->fetch();
     }
-    catch (\Klarna_Checkout_ApiErrorException $e) {
-      debug($e->getMessage(), TRUE);
-      debug($e->getPayload(), TRUE);
-    }
+    $klarna_order->fetch();
 
     return $klarna_order;
   }
@@ -143,46 +191,24 @@ class KlarnaManager {
   }
 
   /**
-   * Helper function that returns the Klarna Checkout order management endpoint.
-   *
-   * @return string
-   *   The Klarna Checkout endpoint URI.
-   */
-  public function getBaseEndpoint(array $plugin_configuration) {
-    // Server URI.
-    if ($plugin_configuration['live_mode'] == 'live') {
-      $uri = Klarna_Checkout_Connector::BASE_URL;
-    }
-    else {
-      $uri = Klarna_Checkout_Connector::BASE_TEST_URL;
-    }
-    return $uri;
-  }
-
-  /**
    * Get Klarna Connector.
    *
-   * @param array $plugin_configuration
-   *   The plugin configuration.
+   * @param \Drupal\commerce_order\Entity\OrderInterface $order
+   *   The order.
    *
    * @return \Klarna_Checkout_ConnectorInterface
    *   Klarna Connector.
    */
-  public function getConnector(array $plugin_configuration) {
-    // Server URI.
-    if ($plugin_configuration['live_mode'] == 'live') {
-      $uri = Klarna_Checkout_Connector::BASE_URL;
-    }
-    else {
-      $uri = Klarna_Checkout_Connector::BASE_TEST_URL;
-    }
+  public function getConnector(OrderInterface $order) {
+    if (!$this->connector instanceof \Klarna_Checkout_ConnectorInterface) {
+      $plugin = $this->getPlugin($order);
 
-    $connector = Klarna_Checkout_Connector::create(
-      $plugin_configuration['password'],
-      $uri
-    );
-
-    return $connector;
+      return Klarna_Checkout_Connector::create(
+        $plugin->getPassword(),
+        $plugin->getApiUri()
+      );
+    }
+    return $this->connector;
   }
 
   /**
@@ -190,24 +216,24 @@ class KlarnaManager {
    *
    * @param \Drupal\commerce_order\Entity\OrderInterface $order
    *   The order.
-   * @param string $checkout_id
-   *   Klarna Checkout Order id.
    *
-   * @return \Klarna_Checkout_Order
+   * @return \Klarna_Checkout_Order|null
    *   Klarna order.
    */
-  public function getOrder(OrderInterface $order, $checkout_id) {
+  public function getOrder(OrderInterface $order) {
     try {
-      $connector = $this->getConnector($this->getPluginConfiguration($order));
-      $klarna_order = new Klarna_Checkout_Order($connector, $checkout_id);
+      $klarna_order = new Klarna_Checkout_Order($this->getConnector($order), $order->getData('klarna_id'));
       $klarna_order->fetch();
+
+      return $klarna_order;
     }
     catch (\Klarna_Checkout_ApiErrorException $e) {
+      // @todo Remove these.
       debug($e->getMessage(), TRUE);
       debug($e->getPayload(), TRUE);
     }
 
-    return $klarna_order;
+    return NULL;
   }
 
   /**
@@ -220,14 +246,21 @@ class KlarnaManager {
    */
   public function updateBillingProfile(OrderInterface $order, array $klarna_billing_address) {
     if ($billing_profile = $order->getBillingProfile()) {
+      $street_address = '';
+
+      if (array_key_exists('street_address', $klarna_billing_address)) {
+        $street_address = $klarna_billing_address['street_address'];
+      }
+      elseif (array_key_exists('street_name', $klarna_billing_address)) {
+        $street_address = sprintf('%s %s', $klarna_billing_address['street_name'], $klarna_billing_address['street_number']);
+      }
+
       $billing_profile->get('address')->first()->setValue([
         'given_name' => $klarna_billing_address['given_name'],
         'family_name' => $klarna_billing_address['family_name'],
         // Only in Sweden, Norway and Finland: Street address.
         // Only in Germany and Austria: Street name and Street number.
-        'address_line1' => array_key_exists('street_address', $klarna_billing_address) ?
-          $klarna_billing_address['street_address'] :
-          $klarna_billing_address['street_name'] . ' ' . $klarna_billing_address['street_number'],
+        'address_line1' => $street_address,
         'postal_code' => $klarna_billing_address['postal_code'],
         'locality' => $klarna_billing_address['city'],
         'country_code' => Unicode::strtoupper($klarna_billing_address['country']),
@@ -242,28 +275,26 @@ class KlarnaManager {
    * @param \Drupal\commerce_order\Entity\OrderInterface $order
    *   The order.
    *
-   * @return array
+   * @return \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout
    *   Plugin configuration.
    */
-  protected function getPluginConfiguration(OrderInterface $order) {
+  protected function getPlugin(OrderInterface $order) {
     /** @var \Drupal\commerce_payment\Entity\PaymentGatewayInterface $payment_gateway */
     $payment_gateway = $order->payment_gateway->entity;
-    /** @var \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout $payment_gateway_plugin */
-    $payment_gateway_plugin = $payment_gateway->getPlugin();
 
-    return $payment_gateway_plugin->getConfiguration();
+    return $payment_gateway->getPlugin();
   }
 
   /**
-   * Get country code from locale setting.
+   * Gets the country code from language setting.
    *
-   * @param string $locale
-   *   Locale.
+   * @param string $language
+   *   The language.
    *
-   * @return bool|mixed
-   *   Country code.
+   * @return bool|string
+   *   The language or FALSE if not found.
    */
-  protected function getCountryFromLocale($locale = 'sv-se') {
+  protected function getCountryFromLocale($language) {
     $country_codes = [
       'sv-se' => 'SE',
       'fi-fi' => 'FI',
@@ -273,7 +304,7 @@ class KlarnaManager {
       'de-at' => 'AT',
     ];
 
-    return empty($country_codes[$locale]) ? FALSE : $country_codes[$locale];
+    return empty($country_codes[$language]) ? FALSE : $country_codes[$language];
   }
 
 }

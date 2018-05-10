@@ -2,19 +2,23 @@
 
 namespace Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway;
 
+use Drupal\commerce_klarna_checkout\Event\Events;
+use Drupal\commerce_klarna_checkout\Event\TransactionAlterEvent;
 use Drupal\commerce_klarna_checkout\KlarnaManager;
+use Drupal\commerce_order\Entity\Order;
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_payment\Exception\PaymentGatewayException;
-use Drupal\commerce_payment\PaymentMethodTypeManager;
-use Drupal\commerce_payment\PaymentTypeManager;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\OffsitePaymentGatewayBase;
-use Drupal\Component\Datetime\TimeInterface;
-use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\SupportsNotificationsInterface;
+use Drupal\Component\Utility\UrlHelper;
 use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
 
 /**
  * Provides the Off-site Redirect payment gateway.
@@ -28,7 +32,7 @@ use Symfony\Component\HttpFoundation\Request;
  *   },
  * )
  */
-class KlarnaCheckout extends OffsitePaymentGatewayBase {
+class KlarnaCheckout extends OffsitePaymentGatewayBase implements SupportsNotificationsInterface {
 
   /**
    * Service used for making API calls using Klarna Checkout library.
@@ -45,49 +49,66 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
   protected $logger;
 
   /**
-   * KlarnaCheckout constructor.
+   * The event dispatcher.
    *
-   * @param array $configuration
-   *   A configuration array containing information about the plugin instance.
-   * @param string $plugin_id
-   *   The plugin_id for the plugin instance.
-   * @param mixed $plugin_definition
-   *   The plugin implementation definition.
-   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
-   *   The entity type manager.
-   * @param \Drupal\commerce_payment\PaymentTypeManager $payment_type_manager
-   *   The payment type manager.
-   * @param \Drupal\commerce_payment\PaymentMethodTypeManager $payment_method_type_manager
-   *   The payment method type manager.
-   * @param \Drupal\Component\Datetime\TimeInterface $time
-   *   The time.
-   * @param \Drupal\commerce_klarna_checkout\KlarnaManager $klarnaManager
-   *   The Klarna manager.
-   * @param \Psr\Log\LoggerInterface $logger
-   *   A logger instance.
+   * @var \Symfony\Component\EventDispatcher\EventDispatcherInterface
    */
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, EntityTypeManagerInterface $entity_type_manager, PaymentTypeManager $payment_type_manager, PaymentMethodTypeManager $payment_method_type_manager, TimeInterface $time, KlarnaManager $klarnaManager, LoggerInterface $logger) {
-    parent::__construct($configuration, $plugin_id, $plugin_definition, $entity_type_manager, $payment_type_manager, $payment_method_type_manager, $time);
-
-    $this->klarna = $klarnaManager;
-    $this->logger = $logger;
-  }
+  protected $eventDispatcher;
 
   /**
    * {@inheritdoc}
    */
   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
-    return new static(
-      $configuration,
-      $plugin_id,
-      $plugin_definition,
-      $container->get('entity_type.manager'),
-      $container->get('plugin.manager.commerce_payment_type'),
-      $container->get('plugin.manager.commerce_payment_method_type'),
-      $container->get('datetime.time'),
-      $container->get('commerce_klarna_checkout.payment_manager'),
-      $container->get('logger.factory')->get('commerce_klarna_checkout')
-    );
+    /** @var self $instance */
+    $instance = parent::create($container, $configuration, $plugin_id, $plugin_definition);
+    // Populate via setters to avoid overriding the parent constructor.
+    $instance->setPaymentManager($container->get('commerce_klarna_checkout.payment_manager'))
+      ->setEventDispatcher($container->get('event_dispatcher'))
+      ->setLogger($container->get('logger.factory')->get('commerce_klarna_checkout'));
+
+    return $instance;
+  }
+
+  /**
+   * Sets the event dispatcher.
+   *
+   * @param \Symfony\Component\EventDispatcher\EventDispatcherInterface $eventDispatcher
+   *   The event dispatcher.
+   *
+   * @return $this
+   *   The self.
+   */
+  public function setEventDispatcher(EventDispatcherInterface $eventDispatcher) {
+    $this->eventDispatcher = $eventDispatcher;
+    return $this;
+  }
+
+  /**
+   * Sets the payment manager.
+   *
+   * @param \Drupal\commerce_klarna_checkout\KlarnaManager $manager
+   *   The klarna manager.
+   *
+   * @return $this
+   *   The self.
+   */
+  public function setPaymentManager(KlarnaManager $manager) {
+    $this->klarna = $manager;
+    return $this;
+  }
+
+  /**
+   * Sets the logger.
+   *
+   * @param \Psr\Log\LoggerInterface $logger
+   *   The logger.
+   *
+   * @return $this
+   *   The self.
+   */
+  public function setLogger(LoggerInterface $logger) {
+    $this->logger = $logger;
+    return $this;
   }
 
   /**
@@ -102,6 +123,83 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
       'language' => 'sv-se',
       'update_billing_profile' => 0,
     ] + parent::defaultConfiguration();
+  }
+
+  /**
+   * Gets the live mode status.
+   *
+   * @return bool
+   *   Boolean indicating whether we are operating in live mode.
+   */
+  public function isLive() {
+    return $this->configuration['live_mode'] === 'live';
+  }
+
+  /**
+   * Get the language.
+   *
+   * @return string
+   *   The language.
+   */
+  public function getLanguage() {
+    return $this->configuration['language'];
+  }
+
+  /**
+   * Gets the merchant id.
+   *
+   * @return string
+   *   The merchant id.
+   */
+  public function getMerchantId() {
+    return $this->configuration['merchant_id'];
+  }
+
+  /**
+   * Gets the password.
+   *
+   * @return string
+   *   The password.
+   */
+  public function getPassword() {
+    return $this->configuration['password'];
+  }
+
+  /**
+   * Whether we should update the billing profile or not.
+   *
+   * @return bool
+   *   TRUE if we should update billing profile automatically, FALSE if not.
+   */
+  public function updateBillingProfile() {
+    return $this->configuration['update_billing_profile'] == 1;
+  }
+
+  /**
+   * Gets the api uri.
+   *
+   * @return string
+   *   The api uri.
+   */
+  public function getApiUri() {
+    return $this->isLive() ? \Klarna_Checkout_Connector::BASE_URL : \Klarna_Checkout_Connector::BASE_TEST_URL;
+  }
+
+  /**
+   * Gets the terms uri.
+   *
+   * @return \Drupal\Core\GeneratedUrl|string
+   *   The url.
+   */
+  public function getTermsUrl() {
+    $path = $this->configuration['terms_path'];
+
+    $is_external = UrlHelper::isExternal($path);
+
+    if (!$is_external) {
+      $path = Url::fromUserInput($path, ['absolute' => TRUE])->toString();
+    }
+    return $path;
   }
 
   /**
@@ -161,6 +259,28 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
   /**
    * {@inheritdoc}
    */
+  public function validateConfigurationForm(array &$form, FormStateInterface $form_state) {
+    parent::validateConfigurationForm($form, $form_state);
+
+    $terms_path = $form_state->getValue($form['#parents'])['terms_path'];
+
+    try {
+      $is_external = UrlHelper::isExternal($terms_path);
+
+      if (!UrlHelper::isValid($terms_path, $is_external)) {
+        throw new \InvalidArgumentException('Uri is not valid.');
+      }
+    }
+    catch (\InvalidArgumentException $e) {
+      $form_state->setError($form['terms_path'], $this->t('Invalid terms path: @error', [
+        '@error' => $e->getMessage(),
+      ]));
+    }
+  }
+
+  /**
+   * {@inheritdoc}
+   */
   public function submitConfigurationForm(array &$form, FormStateInterface $form_state) {
     parent::submitConfigurationForm($form, $form_state);
     if (!$form_state->getErrors()) {
@@ -175,10 +295,38 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
   }
 
   /**
+   * Creates a new payment for given order.
+   *
+   * @param \Drupal\commerce_order\Entity\OrderInterface $order
+   *   The commerce order.
+   * @param \Klarna_Checkout_ResourceInterface $klarna_order
+   *   The klarna order.
+   *
+   * @return \Drupal\commerce_payment\Entity\PaymentInterface
+   *   The payment.
+   */
+  protected function createPayment(OrderInterface $order, \Klarna_Checkout_ResourceInterface $klarna_order) {
+    $payment_storage = $this->entityTypeManager->getStorage('commerce_payment');
+    $payment = $payment_storage->create([
+      'state' => 'authorization',
+      'amount' => $order->getTotalPrice(),
+      'payment_gateway' => $this->entityId,
+      'order_id' => $order->id(),
+      'test' => $this->getMode() == 'test',
+      'remote_id' => $klarna_order['id'],
+      'remote_state' => 'paid',
+      'authorized' => $this->time->getRequestTime(),
+    ]);
+    $payment->save();
+
+    return $payment;
+  }
+
+  /**
    * {@inheritdoc}
    */
   public function onReturn(OrderInterface $order, Request $request) {
-    $klarna_order = $this->klarna->getOrder($order, $order->getData('klarna_id'));
+    $klarna_order = $this->klarna->getOrder($order);
 
     if (!isset($klarna_order['status']) || $klarna_order['status'] !== 'checkout_complete') {
       $this->logger->error(
@@ -191,124 +339,121 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
       throw new PaymentGatewayException();
     }
 
-    $payment_storage = $this->entityTypeManager->getStorage('commerce_payment');
-    $payment = $payment_storage->create([
-      'state' => 'authorization',
-      'amount' => $order->getTotalPrice(),
-      'payment_gateway' => $this->entityId,
-      'order_id' => $order->id(),
-      'test' => $this->getMode() == 'test',
-      'remote_id' => $request->query->get('klarna_order_id'),
-      'remote_state' => 'paid',
-      'authorized' => \Drupal::time()->getRequestTime(),
-    ]);
-    $payment->save();
+    // Create payment only if no payment exist yet.
+    if (!$this->getPayment($order)) {
+      $this->createPayment($order, $klarna_order);
+    }
   }
 
   /**
    * {@inheritdoc}
    */
   public function onNotify(Request $request) {
-    /** @var \Drupal\commerce_order\Entity\OrderInterface $commerce_order */
-    $commerce_order = $this->entityTypeManager
-      ->getStorage('commerce_order')
-      ->load($request->query->get('commerce_order'));
+    $commerce_order = NULL;
+
+    if ($order_id = $request->query->get('commerce_order')) {
+      $commerce_order = Order::load($order_id);
+    }
 
     if (!$commerce_order instanceof OrderInterface) {
-      $this->logger->notice(
-        $this->t('Notify callback called for an invalid order @order [@values]', [
-          '@order' => $request->query->get('commerce_order'),
-          '@values' => print_r($request->query->all(), TRUE),
-        ])
-      );
-      return FALSE;
+      $error = $this->t('Notify callback called for an invalid order @order [@values]', [
+        '@order' => $request->query->get('commerce_order'),
+        '@values' => print_r($request->query->all(), TRUE),
+      ]);
+
+      $this->logger->notice($error);
+
+      return new Response($error, Response::HTTP_BAD_REQUEST);
+    }
+    try {
+      $this->completeKlarnaCheckout($commerce_order);
+    }
+    catch (\InvalidArgumentException $e) {
+      return new Response($e->getMessage(), Response::HTTP_BAD_REQUEST);
     }
 
-    // Validate Klarna order id.
-    if ($commerce_order->getData('klarna_id') !== $request->query->get('klarna_order_id')) {
-      $this->logger->error(
-        $this->t('Notify callback failed for order @order. Request param for Klarna order id does not match the one given by Klarna [@id]', [
-          '@order' => $commerce_order->id(),
-          '@id' => $commerce_order->getData('klarna_id'),
-        ])
-      );
-      return FALSE;
-    }
+    return new Response();
+  }
 
+  /**
+   * Completes the Klarna checkout for given order.
+   *
+   * @param \Drupal\commerce_order\Entity\OrderInterface $order
+   *   The order.
+   */
+  public function completeKlarnaCheckout(OrderInterface $order) {
     // Get order from Klarna.
-    $klarna_order = $this->klarna->getOrder($commerce_order, $commerce_order->getData('klarna_id'));
+    $klarna_order = $this->klarna->getOrder($order);
+
+    if (!$klarna_order instanceof \Klarna_Checkout_ResourceInterface) {
+      $error = $this->t('No order details returned from Klarna to order @order_id', [
+        '@order_id' => $order->id(),
+      ]);
+      $this->logger->error($error);
+
+      throw new \InvalidArgumentException($error);
+    }
+
+    if ($klarna_order['status'] !== 'checkout_complete') {
+      $error = $this->t('Invalid order status (@status) received from Klarna for order @order_id', [
+        '@status' => $klarna_order['status'],
+        '@order_id' => $order->id(),
+      ]);
+      $this->logger->error($error);
+
+      throw new \InvalidArgumentException($error);
+    }
 
     // Validate commerce order and acknowledge order to Klarna.
-    if (isset($klarna_order)) {
-      if ($klarna_order['status'] == 'checkout_complete') {
-        /** @var \Drupal\commerce_payment\Entity\PaymentInterface $payment */
-        $payment = $this->getPayment($commerce_order);
-        if (isset($payment)) {
-          // Mark payment as captured.
-          $payment->setState('completed');
-          $payment->save();
-
-          // Ensure that commerce order is placed before updating orders (commerce/klarna).
-          if ($commerce_order->getPlacedTime() !== NULL) {
-            // Update billing profile (if enabled).
-            if ($this->configuration['update_billing_profile'] && isset($klarna_order['billing_address'])) {
-              $this->klarna->updateBillingProfile($commerce_order, $klarna_order['billing_address']);
-            }
-
-            // Validate commerce order.
-            $transition = $commerce_order->getState()
-              ->getWorkflow()
-              ->getTransition('validate');
-            if (isset($transition)) {
-              $commerce_order->getState()->applyTransition($transition);
-            }
-
-            // Save order changes.
-            $commerce_order->save();
-
-            // Update Klarna order status.
-            $update = ['status' => 'created'];
-            $klarna_order->update($update);
-          }
-        }
-
-        if ($klarna_order['status'] !== 'created') {
-          // We may end up here due to following reasons:
-          // - First push notification sent before commerce order completion
-          // (i.e. payment and/or order not placed yet)
-          // - User is not redirected to order complete page (after payment
-          // completed at Klarna's end.)
-          // Please note that Klarna will send the push notifications every two
-          // hours for a total of 48 hours or until order has been confirmed.
-          // The pusher works on 2 hour clock intervals.
-          // TODO: Should we dispatch event here in order to allow eg.
-          // re-post the push notification again (with delay), or complete order
-          // programmatically after number of push notifications received.
-          $this->logger->notice(
-            $this->t('Push notification for Order @order [state: @state, ref: @ref] ignored. Klarna order status not updated.', [
-              '@order' => $commerce_order->id(),
-              '@ref' => $commerce_order->getData('klarna_id'),
-              '@state' => $commerce_order->getState()->value,
-            ])
-          );
-        }
-      }
-      else {
-        $this->logger->error(
-          $this->t('Invalid order status (@status) received from Klarna for order @order_id', [
-            '@status' => $klarna_order['status'],
-            '@order_id' => $commerce_order->id(),
-          ])
-        );
-      }
+    if (!$payment = $this->getPayment($order)) {
+      // Create new payment if no payment exist yet. This usually happens when
+      // user doesn't return from the payment gateway or when Klarna's IPN
+      // completes the payment before the customer is redirected back from the
+      // payment gateway.
+      $payment = $this->createPayment($order, $klarna_order);
     }
-    else {
-      $this->logger->error(
-        $this->t('No order details returned from Klarna to order @order_id', [
-          '@order_id' => $commerce_order->id(),
-        ])
-      );
+    // Update billing profile (if enabled).
+    if ($this->updateBillingProfile() && isset($klarna_order['billing_address'])) {
+      $this->klarna->updateBillingProfile($order, $klarna_order['billing_address']);
     }
+    /** @var \Drupal\commerce_klarna_checkout\Event\TransactionAlterEvent $event */
+    $event = $this->eventDispatcher
+      ->dispatch(Events::TRANSACTION_ALTER, new TransactionAlterEvent($order, 'created', [
+        'status' => 'created',
+      ]));
+
+    // Allow other modules to alter values.
+    $update = $event->getValues();
+
+    // Update Klarna order status.
+    $klarna_order->update($update);
+
+    if ($klarna_order['status'] !== 'created') {
+      $error = $this->t('Push notification for Order @order [state: @state, ref: @ref] ignored. Klarna order status not updated.', [
+        '@order' => $order->id(),
+        '@ref' => $order->getData('klarna_id'),
+        '@state' => $order->getState()->value,
+      ]);
+      // Please note that Klarna will send the push notifications every two
+      // hours for a total of 48 hours or until order has been confirmed.
+      $this->logger->notice($error);
+
+      throw new \InvalidArgumentException($error);
+    }
+    // Mark payment as captured.
+    $payment->setState('completed');
+    $payment->save();
+
+    // Validate commerce order.
+    $transition = $order->getState()
+      ->getWorkflow()
+      ->getTransition('validate');
+
+    if (isset($transition)) {
+      $order->getState()->applyTransition($transition);
+    }
+    // Save order changes.
+    $order->save();
   }
 
   /**
@@ -320,10 +465,18 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
    * @return \Klarna_Checkout_Order
    *   The Klarna order.
    */
-  public function setKlarnaCheckout(PaymentInterface $payment) {
+  public function createKlarnaCheckout(PaymentInterface $payment) {
     $order = $payment->getOrder();
 
-    return $this->klarna->buildTransaction($order);
+    $klarna_order = $this->klarna->buildTransaction($order);
+
+    if (!isset($klarna_order['id'])) {
+      throw new \InvalidArgumentException('Failed to fetch order id.');
+    }
+    $order->setData('klarna_id', $klarna_order['id']);
+    $order->save();
+
+    return $klarna_order;
   }
 
   /**
@@ -345,7 +498,7 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase {
       return FALSE;
     }
     foreach ($payments as $payment) {
-      if ($payment->getPaymentGateway()->getPluginId() !== 'klarna_checkout' || $payment->getAmount()->compareTo($order->getTotalPrice()) !== 0) {
+      if ($payment->getPaymentGateway()->getPluginId() !== $this->pluginId || $payment->getAmount()->compareTo($order->getTotalPrice()) !== 0) {
         continue;
       }
       $klarna_payment = $payment;

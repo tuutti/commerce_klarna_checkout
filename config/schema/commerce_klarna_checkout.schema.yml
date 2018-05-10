@@ -11,11 +11,11 @@ commerce_payment.commerce_payment_gateway.plugin.klarna_checkout:
       type: string
       label: 'Live mode'
     terms_path:
-      type: path
+      type: string
       label: 'Terms path'
     language:
-      type: sequence
+      type: string
       label: 'Language'
     update_billing_profile:
-      type: sequence
+      type: integer
       label: 'Update billing profile'

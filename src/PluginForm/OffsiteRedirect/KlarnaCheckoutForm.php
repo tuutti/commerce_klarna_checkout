@@ -3,9 +3,20 @@
 namespace Drupal\commerce_klarna_checkout\PluginForm\OffsiteRedirect;
 
 use Drupal\commerce_payment\PluginForm\PaymentOffsiteForm as BasePaymentOffsiteForm;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\DependencyInjection\DependencySerializationTrait;
 use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Messenger\MessengerTrait;
+use Drupal\Core\StringTranslation\StringTranslationTrait;
 
+/**
+ * Provides the Klarna checkout payment form.
+ */
 class KlarnaCheckoutForm extends BasePaymentOffsiteForm {
+
+  use MessengerTrait;
+  use StringTranslationTrait;
+  use DependencySerializationTrait;
 
   /**
    * {@inheritdoc}
@@ -18,24 +29,35 @@ class KlarnaCheckoutForm extends BasePaymentOffsiteForm {
     /** @var \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout $payment_gateway_plugin */
     $payment_gateway_plugin = $payment->getPaymentGateway()->getPlugin();
 
+    if (!isset($form['#cache']['tags'])) {
+      $form['#cache']['tags'] = [];
+    }
+    $form['#cache']['tags'] = Cache::mergeTags($form['#cache']['tags'], $payment->getPaymentGateway()->getCacheTags());
+
+    if (!$order = $payment->getOrder()) {
+      $this->messenger()->addError($this->t('The provided payment has no order referenced. Please contact store administration if the problem persists.'));
+
+      return $form;
+    }
+
+    $error = $this->t('Failed to render Klarna payment form. Please contact store administration if the problem persists.');
+
     try {
-      $order = $payment->getOrder();
-      if (empty($order)) {
-        throw new \InvalidArgumentException('The provided payment has no order referenced.');
-      }
-
       // Add cart items and create a checkout order.
-      $klarna_order = $payment_gateway_plugin->setKlarnaCheckout($payment);
-
-      // Save klarna order id.
-      $order->setData('klarna_id', $klarna_order['id']);
-      $order->save();
-
-      // Get checkout snippet.
-      $snippet = $klarna_order['gui']['snippet'];
+      $klarna_order = $payment_gateway_plugin->createKlarnaCheckout($payment);
     }
     catch (\Exception $e) {
-      debug($e->getMessage(), TRUE);
+      $this->messenger()->addError($error);
+
+      return $form;
+    }
+    // Get checkout snippet.
+    $snippet = isset($klarna_order['gui']['snippet']) ? $klarna_order['gui']['snippet'] : NULL;
+
+    if (!$snippet) {
+      $this->messenger()->addError($error);
+
+      return $form;
     }
 
     // Embed snippet to plugin form (no redirect needed).
