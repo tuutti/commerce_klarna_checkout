@@ -15,13 +15,6 @@ abstract class KlarnaKernelBase extends EntityKernelTestBase {
   use StoreCreationTrait;
 
   /**
-   * The event dispatcher.
-   *
-   * @var \Symfony\Component\EventDispatcher\EventDispatcherInterface|\PHPUnit_Framework_MockObject_MockObject
-   */
-  protected $eventDispatcher;
-
-  /**
    * The default store.
    *
    * @var \Drupal\commerce_store\Entity\StoreInterface
@@ -121,9 +114,7 @@ abstract class KlarnaKernelBase extends EntityKernelTestBase {
     );
     $this->gateway->save();
 
-    $this->eventDispatcher = $this->container->get('event_dispatcher');
     $account = $this->createUser([]);
-
     \Drupal::currentUser()->setAccount($account);
   }
 

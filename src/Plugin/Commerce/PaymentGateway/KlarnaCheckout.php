@@ -339,8 +339,11 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase implements SupportsNotifi
       throw new PaymentGatewayException();
     }
 
+    /** @var \Drupal\commerce_payment\PaymentStorage $storage */
+    $storage = $this->entityTypeManager->getStorage('commerce_payment');
+
     // Create payment only if no payment exist yet.
-    if (!$this->getPayment($order)) {
+    if (!$storage->loadByRemoteId($order->getData('klarna_id'))) {
       $this->createPayment($order, $klarna_order);
     }
   }
@@ -403,9 +406,11 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase implements SupportsNotifi
 
       throw new \InvalidArgumentException($error);
     }
+    /** @var \Drupal\commerce_payment\PaymentStorage $storage */
+    $storage = $this->entityTypeManager->getStorage('commerce_payment');
 
     // Validate commerce order and acknowledge order to Klarna.
-    if (!$payment = $this->getPayment($order)) {
+    if (!$payment = $storage->loadByRemoteId($order->getData('klarna_id'))) {
       // Create new payment if no payment exist yet. This usually happens when
       // user doesn't return from the payment gateway or when Klarna's IPN
       // completes the payment before the customer is redirected back from the
@@ -443,17 +448,6 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase implements SupportsNotifi
     // Mark payment as captured.
     $payment->setState('completed');
     $payment->save();
-
-    // Validate commerce order.
-    $transition = $order->getState()
-      ->getWorkflow()
-      ->getTransition('validate');
-
-    if (isset($transition)) {
-      $order->getState()->applyTransition($transition);
-    }
-    // Save order changes.
-    $order->save();
   }
 
   /**
@@ -477,33 +471,6 @@ class KlarnaCheckout extends OffsitePaymentGatewayBase implements SupportsNotifi
     $order->save();
 
     return $klarna_order;
-  }
-
-  /**
-   * Get payment for the given order.
-   *
-   * @param \Drupal\commerce_order\Entity\OrderInterface $order
-   *   The order.
-   *
-   * @return bool|\Drupal\commerce_payment\Entity\PaymentInterface
-   *   The payment.
-   */
-  protected function getPayment(OrderInterface $order) {
-    /** @var \Drupal\commerce_payment\Entity\PaymentInterface[] $payments */
-    $payments = $this->entityTypeManager
-      ->getStorage('commerce_payment')
-      ->loadByProperties(['order_id' => $order->id()]);
-
-    if (empty($payments)) {
-      return FALSE;
-    }
-    foreach ($payments as $payment) {
-      if ($payment->getPaymentGateway()->getPluginId() !== $this->pluginId || $payment->getAmount()->compareTo($order->getTotalPrice()) !== 0) {
-        continue;
-      }
-      $klarna_payment = $payment;
-    }
-    return empty($klarna_payment) ? FALSE : $klarna_payment;
   }
 
 }

@@ -43,6 +43,7 @@ class KlarnaCheckoutTest extends KlarnaKernelBase {
       'payment_gateway' => $this->gateway,
     ]);
     $this->order->addItem($orderItem);
+    $this->order->setData('klarna_id', 123);
     $this->order->save();
   }
 
@@ -121,7 +122,6 @@ class KlarnaCheckoutTest extends KlarnaKernelBase {
    * @covers ::onReturn
    * @covers ::setPaymentManager
    * @covers ::createPayment
-   * @covers ::getPayment
    */
   public function testOnReturn() {
     /** @var \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout $sut */
@@ -182,12 +182,32 @@ class KlarnaCheckoutTest extends KlarnaKernelBase {
 
   /**
    * @covers ::completeKlarnaCheckout
+   * @expectedException \InvalidArgumentException
+   * @expectedExceptionMessage No order details returned from Klarna to order 1
+   */
+  public function testInvalidOrderType() {
+    /** @var \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout $sut */
+    $sut = $this->gateway->getPlugin();
+
+    $mock = $this->getMockBuilder(KlarnaManager::class)
+      ->disableOriginalConstructor()
+      ->getMock();
+
+    $mock->expects($this->any())
+      ->method('getOrder')
+      ->willReturn(NULL);
+
+    $sut->setPaymentManager($mock);
+    $sut->completeKlarnaCheckout($this->order);
+  }
+
+  /**
+   * @covers ::completeKlarnaCheckout
+   * @expectedException \InvalidArgumentException
    * @dataProvider getResourceData
    */
-  public function testCompleteKlarnaCheckout($status, $message, array $expected) {
-    $request = Request::createFromGlobals();
-    $request->query->set('commerce_order', $this->order->id());
-
+  public function testInvalidOrderStatuses($message, array $expected) {
+    $this->expectExceptionMessage($message);
     /** @var \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout $sut */
     $sut = $this->gateway->getPlugin();
 
@@ -203,6 +223,61 @@ class KlarnaCheckoutTest extends KlarnaKernelBase {
         ->method('offsetGet')
         ->willReturn($value);
     }
+    $mock = $this->getMockBuilder(KlarnaManager::class)
+      ->disableOriginalConstructor()
+      ->getMock();
+
+    $mock->expects($this->any())
+      ->method('getOrder')
+      ->willReturn($order);
+
+    $sut->setPaymentManager($mock);
+
+    $sut->completeKlarnaCheckout($this->order);
+  }
+
+  /**
+   * Data provider for ::testInvalidOrderStatuses().
+   */
+  public function getResourceData() {
+    return [
+      [
+        'Invalid order status (checkout_incomplete) received from Klarna for order 1',
+        [
+          'checkout_incomplete',
+          'checkout_incomplete',
+        ],
+      ],
+      [
+        'Push notification for Order 1 [state: draft, ref: 123] ignored. Klarna order status not updated.',
+        [
+          'checkout_complete',
+          'checkout_complete',
+        ],
+      ],
+    ];
+  }
+
+  /**
+   * @covers ::completeKlarnaCheckout
+   * @covers ::onNotify
+   */
+  public function testCompleteNotify() {
+    $request = Request::createFromGlobals();
+    $request->query->set('commerce_order', $this->order->id());
+
+    /** @var \Drupal\commerce_klarna_checkout\Plugin\Commerce\PaymentGateway\KlarnaCheckout $sut */
+    $sut = $this->gateway->getPlugin();
+
+    $connector = $this->getMockBuilder(\Klarna_Checkout_ConnectorInterface::class)
+      ->getMock();
+
+    $order = $this->getMockBuilder(\Klarna_Checkout_Order::class)
+      ->setConstructorArgs([$connector, '123'])
+      ->getMock();
+
+    $order->method('offsetGet')
+      ->will($this->onConsecutiveCalls('checkout_complete', '123', 'created'));
 
     $mock = $this->getMockBuilder(KlarnaManager::class)
       ->disableOriginalConstructor()
@@ -215,34 +290,18 @@ class KlarnaCheckoutTest extends KlarnaKernelBase {
     $sut->setPaymentManager($mock);
 
     $response = $sut->onNotify($request);
-    $this->assertEquals($status, $response->getStatusCode());
-    $this->assertTrue(strpos($response->getContent(), $message) !== FALSE, $response->getContent());
-  }
 
-  public function getResourceData() {
-    return [
-      [
-        Response::HTTP_BAD_REQUEST,
-        'No order details returned from Klarna to order',
-        [],
-      ],
-      [
-        Response::HTTP_BAD_REQUEST,
-        'Invalid order status (checkout_incomplete) received from Klarna for order',
-        [
-          'checkout_incomplete',
-          'checkout_incomplete',
-        ],
-      ],
-      [
-        Response::HTTP_BAD_REQUEST,
-        'Push notification for Order 1 [state: ]',
-        [
-          'checkout_complete',
-          'checkout_complete',
-        ],
-      ],
-    ];
+    $this->assertEquals(Response::HTTP_OK, $response->getStatusCode());
+
+    /** @var \Drupal\commerce_payment\Entity\PaymentInterface[] $payments */
+    $payments = $this->container->get('entity_type.manager')
+      ->getStorage('commerce_payment')
+      ->loadByProperties(['order_id' => $this->order->id()]);
+
+    $this->assertEquals(1, count($payments));
+
+    $payment = reset($payments);
+    $this->assertEquals('completed', $payment->getState()->value);
   }
 
 }
